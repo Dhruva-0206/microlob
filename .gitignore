@@ -1,0 +1,30 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go build/coverage output
+*.out
+/bin/
+/dist/
+
+# Go workspace / dependency files that shouldn't be committed
+go.work
+go.work.sum
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE / editor folders
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
