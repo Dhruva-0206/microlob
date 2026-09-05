@@ -135,7 +135,7 @@ func restingQuantity(book *OrderBook) int64 {
 func TestEngine_ConcurrentSubmitOrder_Stress(t *testing.T) {
 	const numWorkers = 100
 	const minPrice, priceSpread = int64(95), 11 // prices 95..105 inclusive
-	const minQty, qtySpread = int64(1), 20       // quantities 1..20 inclusive
+	const minQty, qtySpread = int64(1), 20      // quantities 1..20 inclusive
 
 	e := NewEngine("STRESS")
 	e.Start()

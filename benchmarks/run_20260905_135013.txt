@@ -1,0 +1,33 @@
+microlob Engine load test — 2026-09-05T13:50:13+05:30
+================================================================
+Total orders submitted:    100000
+Concurrent workers:        8
+Warm-up discarded:         5000 orders (~5% of each worker's range, excluded from percentiles only)
+
+Total wall-clock duration: 141.0369ms
+Throughput:                709034 orders/sec
+
+Observed clock resolution: ~595.4µs (min tick width across 20 observed tick transitions)
+Latency, post-warm-up (microseconds):
+  p50:     0.00
+  p95:     0.00
+  p99:   512.70
+  max: 10373.50
+  WARNING: clock resolution above is far coarser than typical native hardware
+  (~100ns-1us via QueryPerformanceCounter). SubmitOrder's real per-call cost
+  (~1us, see the sequential go test benchmark) is smaller than one tick here, so
+  most per-call reads above are quantized to 0 and the rest jump to whole tick
+  widths - this looks like a virtualized/sandboxed clock source, not real engine
+  behavior. Trust throughput/orders-per-sec above, and ns/op from
+  `go test -bench=. ./internal/orderbook`, more than these percentiles until this
+  is re-run on real (non-virtualized) hardware.
+
+GC during run:
+  GC cycles:      20
+  Total GC pause: 4.2153ms
+
+Runtime environment:
+  GOMAXPROCS: 16
+  NumCPU:     16
+  GOOS/ARCH:  windows/amd64
+  Go version: go1.27.0

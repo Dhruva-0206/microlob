@@ -26,6 +26,11 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
     matching_test.go          table-driven tests: matching/fills/partial fills/market orders
     engine.go                 Engine — single-writer-goroutine concurrency wrapper around OrderBook
     engine_test.go             basic Engine tests + concurrency stress test (run with -race)
+    benchmark_test.go          testing.B benchmarks: sequential + b.RunParallel SubmitOrder throughput
+  cmd/benchmark/
+    main.go                    standalone load generator + latency percentile / GC / clock-resolution reporter
+  benchmarks/
+    run_*.txt                  timestamped reports from cmd/benchmark (see "Benchmarking" below)
 ```
 
 ## What's implemented so far
@@ -55,6 +60,10 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
   with the same signatures as `OrderBook`'s (`BestBid`/`BestAsk` drop the
   error and just return `(0, false)` once stopped), plus `Start()`/`Stop()`
   for lifecycle control. Channel plumbing is entirely hidden from callers.
+- Benchmarking harness: `internal/orderbook/benchmark_test.go` (standard Go
+  `testing.B` benchmarks) and `cmd/benchmark` (a standalone load generator
+  reporting throughput, latency percentiles, and GC stats). See
+  "Benchmarking" below for the approach and current baseline numbers.
 - No persistence. No agents. No Python layer yet.
 
 ## Key architectural decisions (locked in, with why)
@@ -122,6 +131,92 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
   the point of the comparison is to measure the single-writer-goroutine
   design against it once both exist, not to assume one wins.**
 
+## Benchmarking
+
+Two complementary tools, for two different questions:
+
+- **`go test -bench=. ./internal/orderbook`** (`benchmark_test.go`) answers
+  "what does one `SubmitOrder` call cost, on average, isolated from
+  everything else?" `BenchmarkSubmitOrder` is sequential (one goroutine);
+  `BenchmarkSubmitOrder_Parallel` uses `b.RunParallel` to simulate many
+  concurrent submitters — the load shape `Engine` is actually designed for.
+  Both pre-generate every order *before* `b.ResetTimer()` so the timed loop
+  contains nothing but the `SubmitOrder` call itself, not order construction
+  or ID formatting.
+- **`cmd/benchmark`** answers "what does a realistic run of N orders across
+  W concurrent agents actually look like — throughput, tail latency, GC
+  impact?" It's not a test: a standalone program you run directly
+  (`go run ./cmd/benchmark -orders 100000 -workers 8`), because that's a
+  more realistic shape for "simulate a morning of trading" than a `testing.B`
+  loop, and because per-call latency percentiles (p50/p95/p99/max) aren't
+  something `testing.B` reports at all. It records every call's latency into
+  a pre-allocated `[]int64` (nanoseconds) — no per-call allocation in the
+  timed path — discards the first ~5% of *each worker's own* range as
+  warm-up before computing percentiles (warm-up is a per-goroutine effect,
+  so discarding only one global prefix would under-warm every worker but the
+  first), but still counts warm-up calls in total duration/throughput, since
+  they really did happen. It also captures `runtime.MemStats` before/after
+  to report GC cycles and total pause time during the run, and — see below —
+  self-checks the clock it's using before trusting it.
+
+**A clock-resolution gotcha, found in this environment, worth knowing
+about:** `cmd/benchmark` calibrates the actual resolution of `time.Now()` on
+the machine it's running on (polls it back-to-back until it sees ~20 tick
+transitions, reports the smallest one) before reporting latency percentiles,
+because on this machine that resolution turned out to be **very coarse for a
+per-call timer: roughly 500-600 microseconds**, not the ~100ns-1us a
+`QueryPerformanceCounter`-backed clock gives on real Windows hardware. Since
+`SubmitOrder`'s real cost is roughly 1 microsecond (see the sequential
+benchmark below), most individual per-call reads land inside a single tick
+and read as exactly zero, while any call that happens to straddle a tick
+boundary jumps to a whole tick-width or more — that's a clock quantization
+artifact, not a real bimodal latency distribution. This is almost certainly
+a symptom of running inside a virtualized/sandboxed dev environment (Claude
+Code's execution environment), not something to read anything into about
+the engine. `cmd/benchmark` prints the calibrated resolution and a loud
+warning whenever it's above 10us, so a report is self-documenting about
+whether its own percentiles can be trusted. **When this is next run on real,
+non-virtualized hardware, check that warning first** — if it's gone (clock
+resolution in the sub-microsecond range), the percentiles are meaningful; if
+it's still showing, something about that environment is also clock-limited.
+
+**Baseline numbers, recorded on the hardware/environment available to this
+Claude Code session** (see `benchmarks/run_20260905_135013.txt` for the full
+report this came from) — these are for the *current* book implementation
+(`map[int64]*PriceLevel` + sorted-`[]int64` price index, no red-black tree),
+and should be re-measured any time that changes:
+
+- `go test -bench`: ~1,300-1,400 ns/op, ~520 B/op, 8 allocs/op, both
+  sequential and parallel (`cpu: Intel(R) Core(TM) 7 240H`, as detected by
+  the Go toolchain itself).
+- `cmd/benchmark -orders 100000 -workers 8`: ~700,000 orders/sec aggregate
+  throughput (100k orders in ~135-155ms wall-clock). This lines up with the
+  ~1.3-1.4us/op figure above: `Engine`'s single-writer goroutine processes
+  every order strictly one at a time regardless of how many goroutines are
+  submitting concurrently, so **more `-workers` increases contention for that
+  one goroutine's attention, not the goroutine's own processing rate** —
+  throughput here is fundamentally bounded by single-threaded book-mutation
+  cost, not by submitter parallelism. That's an inherent property of having
+  one order book with one linearized sequence of mutations, not a flaw
+  specific to the channel-based design (a mutex-protected book would face
+  the identical ceiling).
+- GC: ~20 GC cycles per 100k-order run, well under 5ms of total pause time —
+  not a meaningful contributor to tail latency at this scale.
+- Per-call latency percentiles from `cmd/benchmark` are **not trustworthy
+  in this environment** for the clock-resolution reason above; don't cite
+  its p50/p95/p99/max numbers as real without re-running on real hardware
+  first and confirming the resolution warning is gone.
+
+**What's missing, and needs a human with access to real hardware to add:**
+this session can report `runtime.NumCPU()`/`GOMAXPROCS` (16/16 here) and the
+CPU model string Go's own benchmark harness detects, but has no reliable way
+to confirm actual physical core count vs. hyperthreading, RAM, whether this
+ran on bare metal vs. a VM/container (the clock-resolution finding above
+strongly suggests some form of virtualization), or thermal/power state
+during the run. **Add real machine specs to the README (or here) once this
+is re-run somewhere those are known**, and re-run `cmd/benchmark` there for
+numbers worth citing in the portfolio.
+
 ## Conventions
 
 - No floating point for prices or quantities, anywhere in this package.
@@ -140,6 +235,10 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
   compiler on PATH (this machine uses a MinGW-w64 gcc installed via winget
   for that purpose) — if it's missing, `go test -race` fails immediately
   with `requires cgo`, not with a race finding.
+- After a change that could affect performance (matching logic, the price
+  index, `Engine`'s channel plumbing), re-run `go test -bench=. ./internal/orderbook`
+  and `go run ./cmd/benchmark`, and update the baseline numbers in the
+  "Benchmarking" section above rather than leaving them stale.
 - `Engine` lives in `internal/orderbook` rather than its own subpackage: it
   wraps `OrderBook` tightly enough (its requests carry `Order`/`Trade`
   values, its `execute` methods take `*OrderBook` directly) that splitting
