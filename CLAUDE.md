@@ -24,6 +24,8 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
     trade.go                 Trade — a single match between an incoming and a resting order
     orderbook_test.go         table-driven tests: FIFO ordering, best bid/ask, cancel, validation
     matching_test.go          table-driven tests: matching/fills/partial fills/market orders
+    engine.go                 Engine — single-writer-goroutine concurrency wrapper around OrderBook
+    engine_test.go             basic Engine tests + concurrency stress test (run with -race)
 ```
 
 ## What's implemented so far
@@ -47,7 +49,13 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
 - `CancelOrder(orderID string) error` — removes a resting order by ID from
   wherever it is, regardless of whether it got there via `AddOrder` directly
   or as `SubmitOrder` leftover.
-- No concurrency handling yet. No persistence. No agents. No Python layer.
+- `Engine`: a concurrency-safe wrapper around one `OrderBook`, using the
+  single-writer-goroutine pattern rather than a mutex — see the dedicated
+  section below. Exposes `SubmitOrder`/`CancelOrder`/`BestBid`/`BestAsk`
+  with the same signatures as `OrderBook`'s (`BestBid`/`BestAsk` drop the
+  error and just return `(0, false)` once stopped), plus `Start()`/`Stop()`
+  for lifecycle control. Channel plumbing is entirely hidden from callers.
+- No persistence. No agents. No Python layer yet.
 
 ## Key architectural decisions (locked in, with why)
 
@@ -82,6 +90,37 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
 - **Trade IDs** are a simple per-book monotonic counter
   (`"<symbol>-TRD-<n>"`), not UUIDs — deterministic and sufficient for a
   single-book, single-process engine at this stage.
+- **Concurrency: `Engine` uses a single-writer goroutine, not a mutex around
+  `OrderBook`.** `Engine` owns one `OrderBook` and runs it inside exactly one
+  goroutine (`run`, started by `Start`). Every public method
+  (`SubmitOrder`/`CancelOrder`/`BestBid`/`BestAsk`) packages its arguments
+  into a small request struct with its own reply channel, sends it on an
+  unbuffered `requests` channel, and blocks on the reply. `run` is the only
+  goroutine that ever touches the `OrderBook`, so no lock is needed — this
+  is Go's "share memory by communicating" idea applied literally: instead of
+  many goroutines coordinating access to shared state with a `sync.Mutex`,
+  they hand work to the one goroutine that owns it and get an answer back on
+  a private channel. The channel is unbuffered on purpose: a caller's send
+  only completes once `run` is ready to receive it, so requests are
+  serialized in true arrival order with no separate queue, and a busy owning
+  goroutine applies backpressure to callers automatically.
+  Each request variant (`submitOrderRequest`, `cancelOrderRequest`,
+  `bestBidRequest`, `bestAskRequest`) is its own small type implementing an
+  `engineRequest` interface (`execute(book *OrderBook)`), rather than one
+  struct with a "kind" tag and a pile of mostly-unused fields — the four
+  operations have genuinely different payloads and response shapes, so
+  method dispatch reads better here than a switch on an enum.
+  Shutdown uses `context.Context`: `Stop()` cancels the context and blocks
+  until `run` has actually exited (a `stopped` channel it closes on the way
+  out), so `Stop()` returning is a real guarantee the book is quiescent, not
+  just a signal that it will be soon. Requests sent concurrently with `Stop`
+  either complete normally or get `ErrEngineStopped` — never a panic or a
+  hang.
+  **This will be benchmarked against a mutex-protected `OrderBook` later, as
+  part of the portfolio's performance comparison. The mutex-based
+  alternative is deliberately not implemented yet — don't add it unprompted;
+  the point of the comparison is to measure the single-writer-goroutine
+  design against it once both exist, not to assume one wins.**
 
 ## Conventions
 
@@ -93,7 +132,21 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
   expected best bid/ask, with an optional `check func(t, *OrderBook)` field
   for scenario-specific extra assertions.
 - Before considering any change done: run `go test ./...` and
-  `go vet ./...` from the module root and confirm both are clean.
+  `go vet ./...` from the module root and confirm both are clean. Any change
+  touching `Engine` or other concurrent code must also pass
+  `go test -race ./...` — a plain `go test` run can pass even with a broken,
+  racy design, since a data race is a matter of timing, not correctness of
+  output on any single run. Note: `-race` requires cgo, which needs a C
+  compiler on PATH (this machine uses a MinGW-w64 gcc installed via winget
+  for that purpose) — if it's missing, `go test -race` fails immediately
+  with `requires cgo`, not with a race finding.
+- `Engine` lives in `internal/orderbook` rather than its own subpackage: it
+  wraps `OrderBook` tightly enough (its requests carry `Order`/`Trade`
+  values, its `execute` methods take `*OrderBook` directly) that splitting
+  it out would just add an import and a stutter (`orderbook.Engine` calling
+  into an `orderbook`-shaped API) with no real encapsulation benefit at this
+  package's current size. Revisit if the package grows enough that this
+  stops being true.
 - Comments should explain *why* a data structure or approach was chosen, not
   restate what the code does — identifiers should already make the "what"
   obvious.
@@ -104,8 +157,11 @@ orderbook-engine/          Go module root (go.mod: module orderbook-engine)
   The sorted-slice approach is a known, intentional placeholder to be
   benchmarked against, not a gap to silently "fix."
 - No Kafka or any external message bus/queue.
-- No concurrency handling (mutexes, channels, goroutine-safety) in
-  `OrderBook` yet.
+- No mutex-based concurrency alternative to `Engine`'s single-writer
+  goroutine — deliberately deferred until there's a single-writer
+  implementation to benchmark it against (there now is: see `Engine` in the
+  architectural decisions above). Don't add a `sync.Mutex`-protected
+  `OrderBook` variant unprompted.
 - No persistence layer (database, snapshotting, WAL).
 - No simulated trading agents yet.
 - No Python quant analysis layer yet.
